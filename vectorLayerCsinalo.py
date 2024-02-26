@@ -1,0 +1,1 @@
+# Create a GeoJSON file with 3 random points and 3 random attributes:
