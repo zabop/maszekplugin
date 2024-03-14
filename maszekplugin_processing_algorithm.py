@@ -33,13 +33,23 @@ __revision__ = "$Format:%H$"
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessing,
-    QgsFeatureSink,
     QgsProcessingAlgorithm,
-    QgsProcessingParameterFeatureSource,
-    QgsProcessingParameterFileDestination,
-    QgsProcessingParameterRasterLayer
+    QgsProcessingParameterRasterLayer,
+    QgsProcessingParameterFile,
+    QgsProcessingParameterNumber,
+    QgsPointXY,
+    QgsGeometry,
+    QgsProject,
+    QgsVectorLayer,
+    QgsFeature
 )
-
+import rasterio
+import shapely
+import rasterio
+import numpy as np
+import geopandas as gpd
+import astropy.convolution
+import photutils.segmentation
 
 class maszekpluginAlgorithm(QgsProcessingAlgorithm):
     """
@@ -61,6 +71,7 @@ class maszekpluginAlgorithm(QgsProcessingAlgorithm):
 
     OUTPUT = "OUTPUT"
     INPUT = "INPUT"
+    offset = "offset"
 
     def initAlgorithm(self, config):
         """
@@ -68,65 +79,87 @@ class maszekpluginAlgorithm(QgsProcessingAlgorithm):
         with some other properties.
         """
         
-        # We add the input vector features source. It can have any kind of
-        # geometry.
+        # Add input raster field:
         self.addParameter(
-            QgsProcessingParameterFeatureSource(
-                "INPUT1",
-                self.tr("Input vectorlayer1"),
-                [QgsProcessing.TypeVectorAnyGeometry],
-            )
-        )
-
-        # We add the input vector features source. It can have any kind of
-        # geometry.
+            QgsProcessingParameterFile(
+                self.INPUT,
+                self.tr("Input raster")
+        ))
+        
+        # Add float input parameter field called offset:
         self.addParameter(
-            QgsProcessingParameterRasterLayer(
-                "INPUT2",
-                self.tr("Input vectorlayer2"),
-                [QgsProcessing.TypeVectorAnyGeometry],
-            )
-        )
-
-        self.addParameter(
-            QgsProcessingParameterFileDestination(
-                self.OUTPUT,
-                self.tr('Output File'),
-                'CSV files (*.csv)',
-            )
-        )
-
+            QgsProcessingParameterNumber(
+                self.offset,
+                self.tr("meritumdegradáció"),
+                QgsProcessingParameterNumber.Double,
+                0.2
+        ))
+          
+                
     def processAlgorithm(self, parameters, context, feedback):
-        """
-        Here is where the processing itself takes place.
-        """
-        source = self.parameterAsSource(parameters, self.INPUT, context)
-        csv = self.parameterAsFileOutput(parameters, self.OUTPUT, context)
+        with rasterio.open(parameters[self.INPUT], "r") as src:
+            data = src.read(1)
+            profile = src.profile
+            bounds = src.bounds
+            
+        rowNum, colNum = data.shape
 
-        fieldnames = [field.name() for field in source.fields()]
+        totalWidth = bounds.right - bounds.left
+        totalHeight = bounds.top - bounds.bottom
 
-        # Compute the number of steps to display within the progress bar and
-        # get features from source
-        total = 100.0 / source.featureCount() if source.featureCount() else 0
-        features = source.getFeatures()
+        pixelWidth = totalWidth / colNum
+        pixelHeight = totalHeight / rowNum
 
-        with open(csv, 'w') as output_file:
-            # write header
-            line = ','.join(name for name in fieldnames) + '\n'
-            output_file.write(line)
-            for current, f in enumerate(features):
-                # Stop the algorithm if cancel button has been clicked
-                if feedback.isCanceled():
-                    break
+        def pixelcoord_to_epsg3857(row, col):
+            x = bounds.left + (col - 1 / 2) * pixelWidth
+            y = bounds.top - (row - 1 / 2) * pixelHeight
+            return x, y
 
-                # Add a feature in the sink
-                line = ','.join(str(f[name]) for name in fieldnames) + '\n'
-                output_file.write(line)
+        def point_to_square(centerx, centery, pixelWidth=pixelWidth, pixelHeight=pixelHeight):
+            return shapely.geometry.Polygon(
+                [
+                    [centerx - pixelWidth / 2, centery - pixelHeight / 2],
+                    [centerx + pixelWidth / 2, centery - pixelHeight / 2],
+                    [centerx + pixelWidth / 2, centery + pixelHeight / 2],
+                    [centerx - pixelWidth / 2, centery + pixelHeight / 2],
+                    [centerx - pixelWidth / 2, centery - pixelHeight / 2],
+                ]
+            )
 
-                # Update the progress bar
-                feedback.setProgress(int(current * total))
+        data -= np.ones(shape=data.shape) * parameters[self.offset]
 
-        return {self.OUTPUT: csv}
+        kernel = photutils.segmentation.make_2dgaussian_kernel(1.4, size=7)  # FWHM = 3.0
+        convolved_data = astropy.convolution.convolve(data, kernel)
+
+        npixels = 4
+        segment_map = photutils.segmentation.detect_sources(convolved_data, np.ones(shape=data.shape) * 0.08,
+                                                            npixels=npixels, connectivity=4)
+
+        segm_deblend = photutils.segmentation.deblend_sources(convolved_data, segment_map,
+                                                              npixels=npixels, nlevels=500, contrast=0.0001,
+                                                              progress_bar=True)
+
+        shapes = []
+
+        for label in segm_deblend.labels:
+            xs, ys = np.where(np.array(segm_deblend) == label)
+            targetPixels = [[x, y] for (x, y) in zip(xs, ys)]
+
+            shapes.append(
+                shapely.unary_union(
+                    [
+                        point_to_square(*pixelcoord_to_epsg3857(*each)).buffer(0.001)
+                        for each in targetPixels
+                    ]
+                )
+            )
+
+        gpd.GeoSeries(shapes).set_crs(3857).to_file("/Users/palszabo/pal/maszekplugin/pixels.gpkg", driver="GPKG", layer="polygons", engine="pyogrio")
+        
+        shapes = [each.centroid for each in shapes]
+        gpd.GeoSeries(shapes).set_crs(3857).to_file("/Users/palszabo/pal/maszekplugin/pixels.gpkg", driver="GPKG", layer="points", engine="pyogrio")
+        
+        return {"ennyit talaltunk": len(shapes),"offset": parameters[self.offset]}
     
     def name(self):
         """
